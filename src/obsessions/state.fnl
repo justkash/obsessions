@@ -348,8 +348,10 @@
                 (collect-layout-leaves child leaves))
               leaves)))))
 
-(fn restore-window-state [new-winid win-state buf-map session-name]
-  "Apply a saved window state to a restored window."
+(fn restore-window-state [new-winid win-state buf-map session-name cwd]
+  "Apply a saved window state to a restored window.
+   `cwd` anchors any freshly-opened terminal to the restored session's cwd
+   regardless of the window's effective cwd at terminal-open time."
   (when (and new-winid (api.nvim_win_is_valid new-winid) win-state)
     (let [buf-info win-state.buffer]
       (when buf-info
@@ -361,7 +363,7 @@
                       (api.nvim_win_set_buf new-winid live-bufnr)
                       (mark-terminal-session live-bufnr session-name buf-info.terminal-id))
                     (do
-                      (M.open-terminal-in-window new-winid)
+                      (M.open-terminal-in-window new-winid cwd)
                       (let [new-bufnr (api.nvim_win_get_buf new-winid)
                             terminal-id (or (set-terminal-id new-bufnr buf-info.terminal-id)
                                             (ensure-terminal-id new-bufnr))]
@@ -434,12 +436,19 @@
   (if (not state)
       (values nil "no state to restore")
       (do
-        ;; 1. Set cwd
-        (when state.cwd
-          (vim.cmd (.. "cd " (fn*.fnameescape state.cwd))))
-
-        ;; 2. Close everything
+        ;; 1. Close everything first so the surviving anchor tab/window is
+        ;;    the only context whose locals we need to neutralise.
         (close-all-buffers)
+
+        ;; 2. Apply cwd. `:cd` only changes the global cwd; any window-local
+        ;;    or tab-local cwd inherited from the previous session would
+        ;;    otherwise shadow it and cause new terminals (opened later via
+        ;;    `:terminal`) to anchor to the wrong directory.
+        (when state.cwd
+          (let [escaped (fn*.fnameescape state.cwd)]
+            (pcall vim.cmd "lcd!")
+            (pcall vim.cmd (.. "tcd " escaped))
+            (vim.cmd (.. "cd " escaped))))
 
         ;; 3. Create buffers (map old bufnr → new bufnr)
         (let [buf-map {}
@@ -479,7 +488,7 @@
                           win-state (. tab.windows old-winid)]
                       (when (and new-winid win-state)
                         (tset win-map old-winid new-winid)
-                        (restore-window-state new-winid win-state buf-map session-name))))
+                        (restore-window-state new-winid win-state buf-map session-name state.cwd))))
                   (restore-tab-sizes tab old-winids wins win-map)
                   (when tab.active-window
                     (let [active-winid (. win-map (tostring tab.active-window))]
@@ -532,11 +541,17 @@
 ;;; Terminal restoration
 ;;; ===========================================================================
 
-(fn M.open-terminal-in-window [winid]
-  "Open a terminal buffer in the specified window (no command replay)."
+(fn M.open-terminal-in-window [winid cwd]
+  "Open a terminal buffer in the specified window (no command replay).
+   When `cwd` is given, the terminal job is started in that directory
+   regardless of the window's effective cwd."
   (when (api.nvim_win_is_valid winid)
     (api.nvim_set_current_win winid)
-    (vim.cmd "terminal")))
+    (if (and cwd (> (length cwd) 0))
+        (let [bufnr (api.nvim_create_buf false true)]
+          (api.nvim_win_set_buf winid bufnr)
+          (fn*.termopen (or (os.getenv "SHELL") vim.o.shell) {:cwd cwd}))
+        (vim.cmd "terminal"))))
 
 (fn M.open-new-session-terminal [layout-type height width]
   "Open the initial terminal for a new session.
