@@ -7,6 +7,7 @@ Obsessions lets you create, save, switch between, and restore project sessions â
 ## Features
 
 - **Full state capture**: cwd, tabs, windows, splits, buffer order, cursor positions, marks (local + global), jump lists, change lists, location lists, and terminal positions
+- **Live terminal preservation**: terminal buffers keep running in the background when switching sessions within the same Neovim instance
 - **Lazy buffer loading**: large sessions restore instantly by loading only visible buffers upfront; the rest load on first access (with named stubs visible in `:ls`)
 - **Atomic saves**: writes go to a temp file first, then atomically rename into place â€” no half-written session files
 - **Concurrent safety**: advisory locking prevents two Neovim instances from writing to the same session; different instances can work on different sessions
@@ -217,7 +218,13 @@ Captured state includes:
 - Global marks (A-Z)
 - Jump list
 - Location list per window
-- Terminal buffer positions (reopened as fresh terminals in the same splits)
+- Terminal buffer positions and live terminal identities
+
+When switching sessions inside a running Neovim instance, terminal buffers owned
+by background sessions are hidden instead of deleted, so their jobs keep running.
+When the Neovim process exits, those jobs exit with Neovim as usual. Loading a
+saved session in a fresh Neovim instance still opens fresh terminal buffers in
+the saved splits.
 
 ## Architecture
 

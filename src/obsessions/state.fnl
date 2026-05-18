@@ -6,11 +6,115 @@
 (local api vim.api)
 (local fn* vim.fn)
 
+(local terminal-var "obsessions_terminal_id")
+(var terminal-owners {})
+
 (fn get-buf-option [bufnr option]
   (api.nvim_get_option_value option {:buf bufnr}))
 
 (fn set-buf-option [bufnr option value]
   (api.nvim_set_option_value option value {:buf bufnr}))
+
+(fn terminal-buffer? [bufnr]
+  "Return true if `bufnr` is a valid terminal buffer."
+  (and (api.nvim_buf_is_valid bufnr)
+       (= (get-buf-option bufnr "buftype") "terminal")))
+
+(fn get-terminal-id [bufnr]
+  "Return obsessions' stable in-process terminal id for a buffer, if present."
+  (let [(ok id) (pcall api.nvim_buf_get_var bufnr terminal-var)]
+    (when (and ok id)
+      (tostring id))))
+
+(fn set-terminal-id [bufnr terminal-id]
+  "Set a saved terminal id on a terminal buffer, returning the id."
+  (when (and terminal-id (> (length terminal-id) 0))
+    (pcall api.nvim_buf_set_var bufnr terminal-var terminal-id))
+  (get-terminal-id bufnr))
+
+(fn ensure-terminal-id [bufnr]
+  "Ensure a terminal buffer has a stable id for this Neovim instance."
+  (or (get-terminal-id bufnr)
+      (let [id (.. (tostring (vim.uv.hrtime)) ":" (tostring bufnr))]
+        (set-terminal-id bufnr id)
+        id)))
+
+(fn mark-terminal-session [bufnr session-name terminal-id]
+  "Record which session owns a live terminal buffer."
+  (when (and session-name (terminal-buffer? bufnr))
+    (let [id (or terminal-id (ensure-terminal-id bufnr))]
+      (when id
+        (tset terminal-owners id session-name)
+        id))))
+
+(fn collect-visible-buffers []
+  "Return a string-keyed set of buffers currently displayed in windows."
+  (let [visible {}]
+    (each [_ winid (ipairs (api.nvim_list_wins))]
+      (when (api.nvim_win_is_valid winid)
+        (tset visible (tostring (api.nvim_win_get_buf winid)) true)))
+    visible))
+
+(fn cleanup-terminal-owners []
+  "Forget owners for terminal ids that no longer have a live terminal buffer."
+  (let [live {}]
+    (each [_ bufnr (ipairs (api.nvim_list_bufs))]
+      (when (terminal-buffer? bufnr)
+        (let [id (get-terminal-id bufnr)]
+          (when id
+            (tset live id true)))))
+    (each [id _ (pairs terminal-owners)]
+      (when (not (. live id))
+        (tset terminal-owners id nil)))))
+
+(fn terminal-owned-by-other-session? [bufnr session-name visible-bufs]
+  "Return true when a terminal belongs to a different background session."
+  (let [id (ensure-terminal-id bufnr)
+        owner (and id (. terminal-owners id))]
+    (and owner
+         session-name
+         (not= owner session-name)
+         (not (. visible-bufs (tostring bufnr))))))
+
+(fn include-buffer-in-capture? [bufnr session-name visible-bufs]
+  "Return true if this buffer should be written into `session-name`."
+  (if (terminal-buffer? bufnr)
+      (not (terminal-owned-by-other-session? bufnr session-name visible-bufs))
+      (get-buf-option bufnr "buflisted")))
+
+(fn find-live-terminal [buf-info session-name]
+  "Find a live terminal buffer matching saved terminal metadata."
+  (cleanup-terminal-owners)
+  (let [terminal-id buf-info.terminal-id]
+    (when (and terminal-id (> (length terminal-id) 0))
+      (var found nil)
+      (each [_ bufnr (ipairs (api.nvim_list_bufs))]
+        (when (and (not found)
+                   (terminal-buffer? bufnr)
+                   (= (get-terminal-id bufnr) terminal-id))
+          (let [owner (. terminal-owners terminal-id)]
+            (when (or (not owner) (= owner session-name))
+              (set found bufnr)))))
+      found)))
+
+(fn windows-showing-buffer [bufnr]
+  "Return all windows currently displaying `bufnr`."
+  (let [wins []]
+    (each [_ winid (ipairs (api.nvim_list_wins))]
+      (when (and (api.nvim_win_is_valid winid)
+                 (= (api.nvim_win_get_buf winid) bufnr))
+        (table.insert wins winid)))
+    wins))
+
+(fn detach-buffer-from-windows [bufnr]
+  "Move visible windows off `bufnr` so it can be deleted reliably."
+  (let [wins (windows-showing-buffer bufnr)]
+    (when (> (length wins) 0)
+      (let [replacement (api.nvim_create_buf false true)]
+        (pcall set-buf-option replacement "bufhidden" "wipe")
+        (each [_ winid (ipairs wins)]
+          (when (api.nvim_win_is_valid winid)
+            (pcall api.nvim_win_set_buf winid replacement)))))))
 
 ;;; ===========================================================================
 ;;; Capture helpers
@@ -21,13 +125,15 @@
   (let [name (api.nvim_buf_get_name bufnr)
         bt (get-buf-option bufnr "buftype")
         ft (get-buf-option bufnr "filetype")
-        listed (get-buf-option bufnr "buflisted")]
+        listed (get-buf-option bufnr "buflisted")
+        is-terminal (= bt "terminal")]
     {:bufnr bufnr
      :name name
      :buftype bt
      :filetype ft
      :listed listed
-     :is-terminal (= bt "terminal")}))
+     :is-terminal is-terminal
+     :terminal-id (when is-terminal (ensure-terminal-id bufnr))}))
 
 (fn capture-marks [bufnr]
   "Capture local marks (a-z) for a buffer."
@@ -134,14 +240,15 @@
 ;;; Top-level capture
 ;;; ===========================================================================
 
-(fn M.capture []
+(fn M.capture [session-name]
   "Capture the entire editor state. Returns a serialisable table."
+  (cleanup-terminal-owners)
   (let [tabs (api.nvim_list_tabpages)
         current-tab (api.nvim_get_current_tabpage)
+        visible-bufs (collect-visible-buffers)
         ;; Collect all listed buffers (including unlisted terminals)
         all-bufs (icollect [_ b (ipairs (api.nvim_list_bufs))]
-                   (when (or (get-buf-option b "buflisted")
-                             (= (get-buf-option b "buftype") "terminal"))
+                   (when (include-buffer-in-capture? b session-name visible-bufs)
                      b))
         buf-data {}
         buf-marks {}
@@ -149,6 +256,8 @@
     ;; Per-buffer data
     (each [_ bufnr (ipairs all-bufs)]
       (let [info (capture-buffer-info bufnr)]
+        (when info.is-terminal
+          (mark-terminal-session bufnr session-name info.terminal-id))
         (tset buf-data (tostring bufnr)
               (vim.tbl_extend :force info
                               {:marks (capture-marks bufnr)
@@ -177,21 +286,30 @@
 
 (fn close-all-buffers []
   "Close all current buffers and tabs to prepare for restore."
+  (cleanup-terminal-owners)
+  ;; Running terminal jobs are tied to their buffers. Keep those buffers hidden
+  ;; during in-process session switches instead of deleting them.
+  (each [_ bufnr (ipairs (api.nvim_list_bufs))]
+    (when (terminal-buffer? bufnr)
+      (pcall set-buf-option bufnr "bufhidden" "hide")))
   ;; Close all windows/tabs except one
   (vim.cmd "silent! tabonly!")
   (vim.cmd "silent! only!")
-  ;; Delete all buffers
+  ;; Delete non-terminal buffers.
   (each [_ bufnr (ipairs (api.nvim_list_bufs))]
-    (when (api.nvim_buf_is_valid bufnr)
+    (when (and (api.nvim_buf_is_valid bufnr)
+               (not (terminal-buffer? bufnr)))
       (pcall api.nvim_buf_delete bufnr {:force true}))))
 
-(fn create-buffer-stub [buf-info lazy?]
+(fn create-buffer-stub [buf-info lazy? session-name]
   "Create a buffer for the given info. If `lazy?`, create a named stub.
    Returns the new buffer number."
   (if buf-info.is-terminal
-      ;; Terminal: open a new terminal (no command replay)
-      (let [bufnr (api.nvim_create_buf true false)]
-        bufnr)
+      ;; Terminal: reuse the live terminal job if it belongs to this session.
+      (let [bufnr (find-live-terminal buf-info session-name)]
+        (when bufnr
+          (mark-terminal-session bufnr session-name buf-info.terminal-id)
+          bufnr))
       ;; Regular file
       (if (and lazy? (> (length (or buf-info.name "")) 0))
           ;; Lazy stub: create unlisted buf, set name, make listed
@@ -230,16 +348,25 @@
                 (collect-layout-leaves child leaves))
               leaves)))))
 
-(fn restore-window-state [new-winid win-state buf-map]
+(fn restore-window-state [new-winid win-state buf-map session-name]
   "Apply a saved window state to a restored window."
   (when (and new-winid (api.nvim_win_is_valid new-winid) win-state)
     (let [buf-info win-state.buffer]
       (when buf-info
         (let [old-bufnr (tostring buf-info.bufnr)]
           (if buf-info.is-terminal
-              (do
-                (M.open-terminal-in-window new-winid)
-                (tset buf-map old-bufnr (api.nvim_win_get_buf new-winid)))
+              (let [live-bufnr (. buf-map old-bufnr)]
+                (if (and live-bufnr (terminal-buffer? live-bufnr))
+                    (do
+                      (api.nvim_win_set_buf new-winid live-bufnr)
+                      (mark-terminal-session live-bufnr session-name buf-info.terminal-id))
+                    (do
+                      (M.open-terminal-in-window new-winid)
+                      (let [new-bufnr (api.nvim_win_get_buf new-winid)
+                            terminal-id (or (set-terminal-id new-bufnr buf-info.terminal-id)
+                                            (ensure-terminal-id new-bufnr))]
+                        (mark-terminal-session new-bufnr session-name terminal-id)
+                        (tset buf-map old-bufnr new-bufnr)))))
               (let [new-bufnr (. buf-map old-bufnr)]
                 (when new-bufnr
                   (pcall api.nvim_win_set_buf new-winid new-bufnr)))))
@@ -301,7 +428,7 @@
 ;;; Top-level restore
 ;;; ===========================================================================
 
-(fn M.restore [state lazy?]
+(fn M.restore [state lazy? session-name]
   "Restore editor state from a captured state table.
    `lazy?` controls whether non-visible buffers are loaded lazily."
   (if (not state)
@@ -328,10 +455,11 @@
           (each [old-id buf-info (pairs (or state.buffers {}))]
             (let [is-visible (. visible-bufs old-id)
                   use-lazy (and lazy? (not is-visible) (not buf-info.is-terminal))
-                  new-bufnr (create-buffer-stub buf-info use-lazy)]
-              (tset buf-map old-id new-bufnr)
+                  new-bufnr (create-buffer-stub buf-info use-lazy session-name)]
+              (when new-bufnr
+                (tset buf-map old-id new-bufnr))
               ;; Restore marks
-              (when buf-info.marks
+              (when (and new-bufnr buf-info.marks)
                 (restore-marks new-bufnr buf-info.marks))))
 
           ;; 4. Restore tabs and window layouts
@@ -351,7 +479,7 @@
                           win-state (. tab.windows old-winid)]
                       (when (and new-winid win-state)
                         (tset win-map old-winid new-winid)
-                        (restore-window-state new-winid win-state buf-map))))
+                        (restore-window-state new-winid win-state buf-map session-name))))
                   (restore-tab-sizes tab old-winids wins win-map)
                   (when tab.active-window
                     (let [active-winid (. win-map (tostring tab.active-window))]
@@ -369,6 +497,36 @@
 
           ;; Return the buffer map for reference
           buf-map))))
+
+(fn M.clear []
+  "Clear the editor before creating a session, preserving live terminal jobs."
+  (close-all-buffers))
+
+(fn M.rename-session-terminals [old-name new-name]
+  "Move live terminal ownership from one session name to another."
+  (each [id owner (pairs terminal-owners)]
+    (when (= owner old-name)
+      (tset terminal-owners id new-name))))
+
+(fn M.close-session-terminals [session-name]
+  "Close live terminal buffers owned by a deleted session."
+  (let [errors []]
+    (cleanup-terminal-owners)
+    (each [_ bufnr (ipairs (api.nvim_list_bufs))]
+      (let [terminal-id (get-terminal-id bufnr)]
+        (when (and (terminal-buffer? bufnr)
+                   (= (. terminal-owners terminal-id) session-name))
+          (detach-buffer-from-windows bufnr)
+          (let [(ok err) (pcall api.nvim_buf_delete bufnr {:force true})]
+            (if (and ok (not (api.nvim_buf_is_valid bufnr)))
+                (tset terminal-owners terminal-id nil)
+                (table.insert errors
+                              (.. "buffer " (tostring bufnr) ": "
+                                  (or err "still valid after delete"))))))))
+    (cleanup-terminal-owners)
+    (if (> (length errors) 0)
+        (values nil (table.concat errors "; "))
+        true)))
 
 ;;; ===========================================================================
 ;;; Terminal restoration

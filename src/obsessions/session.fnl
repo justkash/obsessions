@@ -103,7 +103,7 @@
                 (if (not lock-handle)
                     (values nil (.. "could not acquire lock: " (or lerr "unknown")))
                     (let [;; Capture state
-                          editor-state (state.capture)
+                          editor-state (state.capture session-name)
                           _ (tset editor-state :session-name session-name)
                           ;; Write atomically
                           (ok werr) (storage.write path editor-state)]
@@ -143,7 +143,7 @@
                             ;; Clean up previous lazy autocmds
                             (lazy-mod.cleanup)
                             ;; Restore state
-                            (state.restore session-data lazy?)
+                            (state.restore session-data lazy? name)
                             (set current-session name)
                             (save-last-session-name name)
                             (vim.notify (.. "Obsessions: loaded session '" name "'")
@@ -163,12 +163,9 @@
               (when current-session
                 (M.save)
                 (lock.release-session (session-path current-session)))
-              ;; Clear the editor
-              (vim.cmd "silent! tabonly!")
-              (vim.cmd "silent! only!")
-              (each [_ bufnr (ipairs (vim.api.nvim_list_bufs))]
-                (when (vim.api.nvim_buf_is_valid bufnr)
-                  (pcall vim.api.nvim_buf_delete bufnr {:force true})))
+              ;; Clear the editor while preserving live terminals from the
+              ;; previous session in the background.
+              (state.clear)
               ;; Open initial terminal
               (state.open-new-session-terminal cfg.new-session-layout
                                                cfg.new-session-terminal-height
@@ -195,6 +192,13 @@
                       (ok derr) (storage.delete path)]
                   (if ok
                       (do
+                        (let [(closed? cerr) (state.close-session-terminals name)]
+                          (when (not closed?)
+                            (vim.notify (.. "Obsessions: warning - deleted session '"
+                                            name
+                                            "' but could not close all terminal buffers: "
+                                            (or cerr "unknown"))
+                                        vim.log.levels.WARN)))
                         ;; If we deleted the current session, clear it
                         (when (= current-session name)
                           (set current-session nil))
@@ -243,6 +247,7 @@
                       (do
                         (pcall vim.uv.fs_unlink (.. old-path ".lock"))
                         (pcall vim.uv.fs_rmdir (.. old-path ".lock.d"))
+                        (state.rename-session-terminals old-name new-name)
                         (when was-current?
                           (lock.claim-session new-path)
                           (set current-session new-name)
