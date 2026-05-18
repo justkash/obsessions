@@ -1,0 +1,12 @@
+# Compiled Lua output (generated from Fennel by Nix build)
+lua/
+
+# Nix
+result
+result-*
+
+# Editor
+.nvim.lua
+.exrc
+*.swp
+*~
