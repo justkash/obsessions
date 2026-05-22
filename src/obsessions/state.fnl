@@ -116,6 +116,19 @@
           (when (api.nvim_win_is_valid winid)
             (pcall api.nvim_win_set_buf winid replacement)))))))
 
+(fn apply-terminal-visibility [active-session-name]
+  "List only the terminals owned by `active-session-name` (plus any terminal not
+   yet claimed by a session); unlist terminals owned by other background
+   sessions. Neovim has one process-global buffer list shared by every session,
+   so this is what keeps a still-alive background terminal out of the active
+   session's `:ls`, `:bnext`/`:bprev`, and buffer pickers. The terminals stay
+   alive and loaded — only their `buflisted` flag changes."
+  (each [_ bufnr (ipairs (api.nvim_list_bufs))]
+    (when (terminal-buffer? bufnr)
+      (let [owner (. terminal-owners (get-terminal-id bufnr))
+            mine? (or (not owner) (= owner active-session-name))]
+        (pcall set-buf-option bufnr "buflisted" mine?)))))
+
 ;;; ===========================================================================
 ;;; Capture helpers
 ;;; ===========================================================================
@@ -287,11 +300,14 @@
 (fn close-all-buffers []
   "Close all current buffers and tabs to prepare for restore."
   (cleanup-terminal-owners)
-  ;; Running terminal jobs are tied to their buffers. Keep those buffers hidden
-  ;; during in-process session switches instead of deleting them.
+  ;; Running terminal jobs are tied to their buffers. Keep those buffers alive
+  ;; but hidden during in-process session switches instead of deleting them.
+  ;; Also unlist them so they leave the single, process-global buffer list;
+  ;; `apply-terminal-visibility` relists the ones owned by the restored session.
   (each [_ bufnr (ipairs (api.nvim_list_bufs))]
     (when (terminal-buffer? bufnr)
-      (pcall set-buf-option bufnr "bufhidden" "hide")))
+      (pcall set-buf-option bufnr "bufhidden" "hide")
+      (pcall set-buf-option bufnr "buflisted" false)))
   ;; Close all windows/tabs except one
   (vim.cmd "silent! tabonly!")
   (vim.cmd "silent! only!")
@@ -503,6 +519,10 @@
           (when lazy?
             (let [lazy-mod (require :obsessions.lazy)]
               (lazy-mod.setup-lazy-autocmds buf-map state.buffers)))
+
+          ;; 7. Surface only this session's terminals in the global buffer list.
+          ;;    Terminals from other sessions stay alive but unlisted.
+          (apply-terminal-visibility session-name)
 
           ;; Return the buffer map for reference
           buf-map))))
