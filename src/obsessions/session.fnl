@@ -180,11 +180,10 @@
   (let [cb (or callback (fn []))]
     (if (not (M.exists name))
         (cb nil (.. "session '" name "' does not exist"))
-        (vim.ui.select
-          ["Yes, delete" "Cancel"]
-          {:prompt (.. "Delete session '" name "'?")}
-          (fn [choice]
-            (if (= choice "Yes, delete")
+        (let [choice (vim.fn.confirm (.. "Delete session '" name "'?")
+                                     "&Yes\n&No" 2 "Question")]
+          ;; vim.fn.confirm shows a Y/N prompt; returns 1 for Yes, 2/0 otherwise.
+          (if (= choice 1)
                 (let [path (session-path name)
                       ;; Release ownership if we own it
                       _ (lock.release-session path)
@@ -206,7 +205,7 @@
                                     vim.log.levels.INFO)
                         (cb true))
                       (cb nil (.. "failed to delete: " (or derr "unknown")))))
-                (cb nil "cancelled")))))))
+                (cb nil "cancelled"))))))
 
 (fn M.rename [old-name new-name]
   "Rename a saved session from `old-name` to `new-name`.
