@@ -20,6 +20,7 @@
               keymaps (or opts.keymaps {})
               delete-key (or keymaps.delete "<C-d>")
               rename-key (or keymaps.rename "<C-r>")
+              create-key (or keymaps.create "<C-n>")
               picker (pickers.new
                        {}
                        {:prompt_title (or opts.prompt "Sessions")
@@ -57,6 +58,14 @@
                                                (opts.on-rename selection.value))))]
                               (map :i rename-key ren-fn)
                               (map :n rename-key ren-fn)))
+                          (when opts.on-create
+                            (let [create-fn (fn []
+                                              ;; Create needs no selection; just
+                                              ;; close the picker and prompt.
+                                              (actions.close prompt-bufnr)
+                                              (opts.on-create))]
+                              (map :i create-key create-fn)
+                              (map :n create-key create-fn)))
                           true)})]
           (picker:find)))))
 

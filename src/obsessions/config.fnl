@@ -14,7 +14,8 @@
    :new-session-terminal-width 80  ;; width when layout is "right"
    :lock-timeout 5000              ;; ms to wait for lock before giving up
    :picker-keymaps {:delete "<C-d>" ;; keys used inside the picker window
-                    :rename "<C-r>"}})
+                    :rename "<C-r>"
+                    :create "<C-n>"}})
 
 (var config (vim.deepcopy defaults))
 

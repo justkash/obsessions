@@ -46,6 +46,18 @@
             (when (and (not ok) err)
               (vim.notify (.. "Obsessions: " err) vim.log.levels.ERROR))))))))
 
+(fn create-handler []
+  "Default picker callback for the create keymap. Prompts for a name and
+   creates a brand new session. Takes no selection."
+  (let [session (require :obsessions.session)]
+    (vim.ui.input
+      {:prompt "New session name: "}
+      (fn [name]
+        (when (and name (not= name ""))
+          (let [(ok err) (session.create name)]
+            (when (and (not ok) err)
+              (vim.notify (.. "Obsessions: " err) vim.log.levels.ERROR))))))))
+
 (fn M.pick-session [opts]
   "Open a session picker. `opts` is a table with:
      :action  - 'switch' | 'load' | 'delete' | 'rename' (default 'switch')
@@ -73,6 +85,7 @@
                              :delete (delete-handler name)
                              :rename (rename-handler name))))
            :on-delete delete-handler
-           :on-rename rename-handler}))))
+           :on-rename rename-handler
+           :on-create create-handler}))))
 
 M

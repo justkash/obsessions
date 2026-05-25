@@ -26,6 +26,7 @@
               keymaps (or opts.keymaps {})
               delete-key (vim-to-fzf-key (or keymaps.delete "<C-d>"))
               rename-key (vim-to-fzf-key (or keymaps.rename "<C-r>"))
+              create-key (vim-to-fzf-key (or keymaps.create "<C-n>"))
               items []
               name-map {}
               actions {:default (fn [selected]
@@ -56,6 +57,11 @@
                             name (. name-map choice)]
                         (when name
                           (opts.on-rename name)))))))
+          (when opts.on-create
+            ;; Create needs no selection; ignore the selected entry.
+            (tset actions create-key
+                  (fn [_]
+                    (opts.on-create))))
           (fzf.fzf_exec items
             {:prompt (.. (or opts.prompt "Sessions") "> ")
              :actions actions})))))
