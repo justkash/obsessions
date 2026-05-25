@@ -317,15 +317,28 @@
                (not (terminal-buffer? bufnr)))
       (pcall api.nvim_buf_delete bufnr {:force true}))))
 
-(fn create-buffer-stub [buf-info lazy? session-name]
+(fn create-buffer-stub [buf-info lazy? session-name cwd]
   "Create a buffer for the given info. If `lazy?`, create a named stub.
+   Terminals reattach to their live job when one still exists (an in-process
+   session switch); otherwise a fresh terminal is opened in the background so
+   the buffer survives a Neovim restart instead of being dropped. `cwd` anchors
+   any freshly-opened terminal to the restored session's directory.
    Returns the new buffer number."
   (if buf-info.is-terminal
-      ;; Terminal: reuse the live terminal job if it belongs to this session.
-      (let [bufnr (find-live-terminal buf-info session-name)]
-        (when bufnr
-          (mark-terminal-session bufnr session-name buf-info.terminal-id)
-          bufnr))
+      ;; Terminal: reuse the live terminal job if it belongs to this session;
+      ;; if none is live (e.g. a fresh Neovim instance), open a fresh terminal
+      ;; in the background so non-visible terminals are restored too instead of
+      ;; being lost and leaving a stray [No Name] buffer in their place.
+      (let [live-bufnr (find-live-terminal buf-info session-name)]
+        (if live-bufnr
+            (do
+              (mark-terminal-session live-bufnr session-name buf-info.terminal-id)
+              live-bufnr)
+            (let [new-bufnr (M.open-background-terminal cwd)]
+              (when new-bufnr
+                (set-terminal-id new-bufnr buf-info.terminal-id)
+                (mark-terminal-session new-bufnr session-name buf-info.terminal-id))
+              new-bufnr)))
       ;; Regular file
       (if (and lazy? (> (length (or buf-info.name "")) 0))
           ;; Lazy stub: create unlisted buf, set name, make listed
@@ -442,6 +455,29 @@
                   (table.insert all-wins w))))))
         all-wins)))
 
+(fn empty-unnamed-buffer? [bufnr]
+  "Return true for a normal, unnamed, unmodified, empty buffer."
+  (and (api.nvim_buf_is_valid bufnr)
+       (= (api.nvim_buf_get_name bufnr) "")
+       (= (get-buf-option bufnr "buftype") "")
+       (not (get-buf-option bufnr "modified"))
+       (let [lines (api.nvim_buf_get_lines bufnr 0 -1 false)]
+         (or (= (length lines) 0)
+             (and (= (length lines) 1) (= (. lines 1) ""))))))
+
+(fn wipe-orphan-empty-buffers [keep]
+  "Delete leftover empty, unnamed buffers that are not part of the restored
+   session and not shown in any window. While `close-all-buffers` clears the
+   startup buffer, Neovim substitutes a scratch buffer to keep its window
+   populated; once the real buffers are restored that scratch buffer lingers as
+   a stray [No Name] entry in `:ls` and buffer pickers. `keep` is a set
+   (string bufnr -> true) of buffers belonging to the restored session."
+  (each [_ bufnr (ipairs (api.nvim_list_bufs))]
+    (when (and (not (. keep (tostring bufnr)))
+               (empty-unnamed-buffer? bufnr)
+               (= (length (windows-showing-buffer bufnr)) 0))
+      (pcall api.nvim_buf_delete bufnr {:force true}))))
+
 ;;; ===========================================================================
 ;;; Top-level restore
 ;;; ===========================================================================
@@ -480,7 +516,7 @@
           (each [old-id buf-info (pairs (or state.buffers {}))]
             (let [is-visible (. visible-bufs old-id)
                   use-lazy (and lazy? (not is-visible) (not buf-info.is-terminal))
-                  new-bufnr (create-buffer-stub buf-info use-lazy session-name)]
+                  new-bufnr (create-buffer-stub buf-info use-lazy session-name state.cwd)]
               (when new-bufnr
                 (tset buf-map old-id new-bufnr))
               ;; Restore marks
@@ -524,6 +560,12 @@
           ;;    Terminals from other sessions stay alive but unlisted.
           (apply-terminal-visibility session-name)
 
+          ;; 8. Drop the stray empty scratch buffer Neovim substitutes while
+          ;;    `close-all-buffers` clears the startup buffer, so it doesn't
+          ;;    linger as a [No Name] entry in pickers.
+          (wipe-orphan-empty-buffers
+            (collect [_ v (pairs buf-map)] (values (tostring v) true)))
+
           ;; Return the buffer map for reference
           buf-map))))
 
@@ -560,6 +602,21 @@
 ;;; ===========================================================================
 ;;; Terminal restoration
 ;;; ===========================================================================
+
+(fn M.open-background-terminal [cwd]
+  "Open a fresh terminal in a listed buffer without attaching it to any window
+   or disturbing the current layout. Used when restoring terminals after a
+   Neovim restart, where the original terminal jobs no longer exist. When `cwd`
+   is given, the shell starts in that directory. Returns the buffer number."
+  (let [bufnr (api.nvim_create_buf true false)]
+    (when bufnr
+      ;; `nvim_buf_call` makes `bufnr` the current buffer in a scratch context,
+      ;; which lets `termopen` attach the job to it without opening a window.
+      (api.nvim_buf_call bufnr
+        (fn []
+          (fn*.termopen (or (os.getenv "SHELL") vim.o.shell)
+                        (if (and cwd (> (length cwd) 0)) {:cwd cwd} {})))))
+    bufnr))
 
 (fn M.open-terminal-in-window [winid cwd]
   "Open a terminal buffer in the specified window (no command replay).
