@@ -68,8 +68,9 @@
         (tset terminal-owners id nil)))))
 
 (fn terminal-owned-by-other-session? [bufnr session-name visible-bufs]
-  "Return true when a terminal belongs to a different background session."
-  (let [id (ensure-terminal-id bufnr)
+  "Return true when a terminal belongs to a different background session.
+   Uses `get-terminal-id` (never mints) so a foreign terminal stays untagged."
+  (let [id (get-terminal-id bufnr)
         owner (and id (. terminal-owners id))]
     (and owner
          session-name
@@ -77,9 +78,12 @@
          (not (. visible-bufs (tostring bufnr))))))
 
 (fn include-buffer-in-capture? [bufnr session-name visible-bufs]
-  "Return true if this buffer should be written into `session-name`."
+  "Return true if this buffer should be written into `session-name`.
+   Only terminals obsessions created/restored (those carrying our id) are
+   captured; this keeps a fuzzy-finder's own UI terminal out of the session."
   (if (terminal-buffer? bufnr)
-      (not (terminal-owned-by-other-session? bufnr session-name visible-bufs))
+      (and (get-terminal-id bufnr)
+           (not (terminal-owned-by-other-session? bufnr session-name visible-bufs)))
       (get-buf-option bufnr "buflisted")))
 
 (fn find-live-terminal [buf-info session-name]
@@ -146,7 +150,9 @@
      :filetype ft
      :listed listed
      :is-terminal is-terminal
-     :terminal-id (when is-terminal (ensure-terminal-id bufnr))}))
+     ;; Read the id without minting: obsessions terminals are tagged at
+     ;; creation/restore, so a nil here means a foreign terminal we don't own.
+     :terminal-id (when is-terminal (get-terminal-id bufnr))}))
 
 (fn capture-marks [bufnr]
   "Capture local marks (a-z) for a buffer."
@@ -615,7 +621,11 @@
       (api.nvim_buf_call bufnr
         (fn []
           (fn*.termopen (or (os.getenv "SHELL") vim.o.shell)
-                        (if (and cwd (> (length cwd) 0)) {:cwd cwd} {})))))
+                        (if (and cwd (> (length cwd) 0)) {:cwd cwd} {}))))
+      ;; Tag it as obsessions-managed so capture can tell it apart from a
+      ;; foreign terminal (e.g. a fuzzy-finder UI). Restore overwrites this
+      ;; with the saved id immediately after.
+      (ensure-terminal-id bufnr))
     bufnr))
 
 (fn M.open-terminal-in-window [winid cwd]
@@ -628,7 +638,9 @@
         (let [bufnr (api.nvim_create_buf false true)]
           (api.nvim_win_set_buf winid bufnr)
           (fn*.termopen (or (os.getenv "SHELL") vim.o.shell) {:cwd cwd}))
-        (vim.cmd "terminal"))))
+        (vim.cmd "terminal"))
+    ;; Tag the freshly-opened terminal as obsessions-managed.
+    (ensure-terminal-id (api.nvim_win_get_buf winid))))
 
 (fn M.open-new-session-terminal [layout-type height width]
   "Open the initial terminal for a new session.
@@ -639,6 +651,8 @@
                 (vim.cmd (.. "resize " (tostring (or height 15)))))
     :right (do (vim.cmd "vertical botright split | terminal")
                (vim.cmd (.. "vertical resize " (tostring (or width 80)))))
-    _ (vim.cmd "terminal")))
+    _ (vim.cmd "terminal"))
+  ;; Tag the new session's initial terminal as obsessions-managed.
+  (ensure-terminal-id (api.nvim_get_current_buf)))
 
 M
